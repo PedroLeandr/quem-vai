@@ -8,6 +8,7 @@ import sqlite3
 import random
 import os
 import sys
+import json
 from tkinter import messagebox
 
 # ─── Tema ─────────────────────────────────────────────────────────────────────
@@ -37,7 +38,7 @@ def _setup_treeview_style():
         pass
     s.configure("Excel.Treeview",
         background="#1e1e2e",
-        foreground="#e0e0e0",
+        foreground="#ffffff",
         fieldbackground="#1e1e2e",
         bordercolor="#2a2a4a",
         borderwidth=0,
@@ -45,7 +46,7 @@ def _setup_treeview_style():
         font=("Segoe UI", 13),
     )
     s.configure("Excel.Treeview.Heading",
-        background="#16213e",
+        background="#28283a",
         foreground="#8899bb",
         font=("Segoe UI", 11, "bold"),
         relief="flat",
@@ -69,11 +70,35 @@ def _setup_treeview_style():
 
 # ─── Base de Dados ────────────────────────────────────────────────────────────
 
-def _db_path() -> str:
-    base = os.path.dirname(
+def _app_folder() -> str:
+    base = os.environ.get("APPDATA") or os.path.dirname(
         sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     )
-    return os.path.join(base, "quem-vai.db")
+    return os.path.join(base, "quem-vai")
+
+
+def _db_path() -> str:
+    folder = _app_folder()
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "quem-vai.db")
+
+
+def _config_path() -> str:
+    return os.path.join(_app_folder(), "config.json")
+
+
+def _load_config() -> dict:
+    try:
+        with open(_config_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_config(cfg: dict) -> None:
+    os.makedirs(_app_folder(), exist_ok=True)
+    with open(_config_path(), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False)
 
 
 def _conn() -> sqlite3.Connection:
@@ -90,7 +115,8 @@ def _init_db() -> None:
         c.executescript("""
             CREATE TABLE IF NOT EXISTS equipas (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL UNIQUE
+                nome TEXT NOT NULL UNIQUE,
+                tipo TEXT NOT NULL DEFAULT 'CEF' CHECK(tipo IN ('CEF','CP'))
             );
             CREATE TABLE IF NOT EXISTS jogadores (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,6 +131,11 @@ def _init_db() -> None:
             c.execute("ALTER TABLE jogadores ADD COLUMN numero_interno TEXT")
         except sqlite3.OperationalError:
             pass
+    with _conn() as c:
+        try:
+            c.execute("ALTER TABLE equipas ADD COLUMN tipo TEXT NOT NULL DEFAULT 'CEF' CHECK(tipo IN ('CEF','CP'))")
+        except sqlite3.OperationalError:
+            pass
 
 
 # ─── Helpers DB ───────────────────────────────────────────────────────────────
@@ -112,9 +143,7 @@ def _init_db() -> None:
 def listar_equipas() -> list[dict]:
     with _conn() as c:
         return c.execute(
-            "SELECT e.id, e.nome,"
-            " COUNT(CASE WHEN j.tipo='CEF' THEN 1 END) cef,"
-            " COUNT(CASE WHEN j.tipo='CP'  THEN 1 END) cp"
+            "SELECT e.id, e.nome, e.tipo, COUNT(j.id) AS total"
             " FROM equipas e LEFT JOIN jogadores j ON j.equipa_id=e.id"
             " GROUP BY e.id ORDER BY e.nome"
         ).fetchall()
@@ -123,20 +152,20 @@ def listar_equipas() -> list[dict]:
 def listar_alunos(equipa_id: int) -> list[dict]:
     with _conn() as c:
         return c.execute(
-            "SELECT id, nome, tipo, numero_interno"
-            " FROM jogadores WHERE equipa_id=? ORDER BY tipo, nome",
+            "SELECT id, nome, numero_interno"
+            " FROM jogadores WHERE equipa_id=? ORDER BY nome",
             (equipa_id,)
         ).fetchall()
 
 
-def criar_equipa(nome: str) -> None:
+def criar_equipa(nome: str, tipo: str) -> None:
     with _conn() as c:
-        c.execute("INSERT INTO equipas (nome) VALUES (?)", (nome,))
+        c.execute("INSERT INTO equipas (nome, tipo) VALUES (?,?)", (nome, tipo))
 
 
-def renomear_equipa(eid: int, novo_nome: str) -> None:
+def atualizar_equipa(eid: int, novo_nome: str, novo_tipo: str) -> None:
     with _conn() as c:
-        c.execute("UPDATE equipas SET nome=? WHERE id=?", (novo_nome, eid))
+        c.execute("UPDATE equipas SET nome=?, tipo=? WHERE id=?", (novo_nome, novo_tipo, eid))
 
 
 def apagar_equipa(eid: int) -> None:
@@ -144,8 +173,10 @@ def apagar_equipa(eid: int) -> None:
         c.execute("DELETE FROM equipas WHERE id=?", (eid,))
 
 
-def adicionar_aluno(nome: str, tipo: str, numero_interno: str, equipa_id: int) -> None:
+def adicionar_aluno(nome: str, numero_interno: str, equipa_id: int) -> None:
     with _conn() as c:
+        eq = c.execute("SELECT tipo FROM equipas WHERE id=?", (equipa_id,)).fetchone()
+        tipo = eq["tipo"] if eq else "CEF"
         c.execute(
             "INSERT INTO jogadores (nome, tipo, numero_interno, equipa_id) VALUES (?,?,?,?)",
             (nome, tipo, numero_interno or None, equipa_id)
@@ -199,7 +230,7 @@ class Sorteio:
 
         with _conn() as c:
             row = c.execute(
-                "SELECT j.nome, j.tipo, j.numero_interno, e.nome AS equipa"
+                "SELECT j.nome, e.tipo, j.numero_interno, e.nome AS equipa"
                 " FROM jogadores j JOIN equipas e ON e.id=j.equipa_id WHERE j.id=?",
                 (jid,)
             ).fetchone()
@@ -208,15 +239,54 @@ class Sorteio:
         return row
 
 
+# ─── Diálogo de Primeiro Uso ─────────────────────────────────────────────────
+
+class DialogoPrimeiroUso(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Bem-vindo!")
+        self.geometry("420x260")
+        self.resizable(False, False)
+        self.nome = ""
+
+        ctk.CTkLabel(self, text="Bem-vindo ao Quem Vai?", font=F_LARGE).pack(pady=(28, 6))
+        ctk.CTkLabel(
+            self,
+            text="Para começar, qual é o teu nome?",
+            font=F_MEDIUM, text_color="gray60"
+        ).pack(pady=(0, 12))
+
+        self.entry = ctk.CTkEntry(self, font=F_MEDIUM, height=BTN_H, width=340,
+                                  placeholder_text="Ex: Luis Reis")
+        self.entry.pack()
+
+        ctk.CTkButton(self, text="Começar", font=F_MEDIUM, height=BTN_H,
+                      command=self._guardar).pack(pady=20)
+        self.entry.bind("<Return>", lambda _: self._guardar())
+        self.after(150, self._on_show)
+
+    def _on_show(self):
+        self.lift()
+        self.grab_set()
+        self.entry.focus_set()
+
+    def _guardar(self):
+        nome = self.entry.get().strip()
+        if not nome:
+            messagebox.showerror("Erro", "Escreve o teu nome para continuar.", parent=self)
+            return
+        self.nome = nome
+        self.destroy()
+
+
 # ─── Diálogo de Equipa ────────────────────────────────────────────────────────
 
 class DialogoEquipa(ctk.CTkToplevel):
     def __init__(self, parent, equipa: dict | None = None):
         super().__init__(parent)
         self.title("Equipa")
-        self.geometry("380x175")
+        self.geometry("380x300")
         self.resizable(False, False)
-        self.grab_set()
         self.resultado = None
 
         ctk.CTkLabel(self, text="Nome da equipa:", font=F_MEDIUM).pack(pady=(20, 6))
@@ -225,9 +295,22 @@ class DialogoEquipa(ctk.CTkToplevel):
         if equipa:
             self.entry.insert(0, equipa["nome"])
 
+        ctk.CTkLabel(self, text="Tipo de alunos:", font=F_MEDIUM).pack(pady=(14, 6))
+        self._seg_tipo = ctk.CTkSegmentedButton(
+            self, values=["CEF", "CP"],
+            font=F_MEDIUM, width=320, height=BTN_H,
+        )
+        self._seg_tipo.set(equipa["tipo"] if equipa else "CEF")
+        self._seg_tipo.pack()
+
         ctk.CTkButton(self, text="Guardar", font=F_MEDIUM, height=BTN_H,
                       command=self._guardar).pack(pady=14)
         self.entry.bind("<Return>", lambda _: self._guardar())
+        self.after(150, self._on_show)
+
+    def _on_show(self):
+        self.lift()
+        self.grab_set()
         self.entry.focus_set()
 
     def _guardar(self):
@@ -235,7 +318,7 @@ class DialogoEquipa(ctk.CTkToplevel):
         if not nome:
             messagebox.showerror("Erro", "O nome não pode estar vazio.", parent=self)
             return
-        self.resultado = nome
+        self.resultado = {"nome": nome, "tipo": self._seg_tipo.get()}
         self.destroy()
 
 
@@ -262,17 +345,15 @@ class TabelaAlunos(tk.Frame):
 
         self.tree = ttk.Treeview(
             self,
-            columns=("tipo", "num", "nome"),
+            columns=("num", "nome"),
             show="headings",
             style="Excel.Treeview",
             selectmode="browse",
         )
-        self.tree.heading("tipo", text="Tipo",       anchor="w")
         self.tree.heading("num",  text="Nº Interno", anchor="w")
         self.tree.heading("nome", text="Nome",        anchor="w")
-        self.tree.column("tipo", width=85,  minwidth=60,  stretch=False)
         self.tree.column("num",  width=130, minwidth=80,  stretch=False)
-        self.tree.column("nome", width=300, minwidth=120, stretch=True)
+        self.tree.column("nome", width=380, minwidth=120, stretch=True)
 
         vsb = ttk.Scrollbar(self, orient="vertical",
                             command=self.tree.yview,
@@ -283,7 +364,7 @@ class TabelaAlunos(tk.Frame):
         vsb.grid(row=0, column=1, sticky="ns")
 
         # Rodapé com dica
-        rodape = tk.Frame(self, bg="#16213e")
+        rodape = tk.Frame(self, bg="#28283a")
         rodape.grid(row=1, column=0, columnspan=2, sticky="ew")
         tk.Label(rodape,
                  text="Clica numa célula para editar  •  Tab/Enter para avançar  "
@@ -293,7 +374,7 @@ class TabelaAlunos(tk.Frame):
                  anchor="w", padx=8, pady=4
                  ).pack(fill="x")
 
-        self.tree.tag_configure("alt",  background="#16213e")
+        self.tree.tag_configure("alt",  background="#28283a", foreground="#ffffff")
         self.tree.tag_configure("novo", foreground="#445566",
                                 font=("Segoe UI", 12, "italic"))
 
@@ -312,10 +393,10 @@ class TabelaAlunos(tk.Frame):
         for i, a in enumerate(listar_alunos(self.equipa_id)):
             tags = ("alt",) if i % 2 else ()
             self.tree.insert("", "end", iid=str(a["id"]),
-                             values=(a["tipo"], a["numero_interno"] or "", a["nome"]),
+                             values=(a["numero_interno"] or "", a["nome"]),
                              tags=tags)
         self.tree.insert("", "end", iid=self.NOVO_ID,
-                         values=("CEF", "", "← escreve aqui para adicionar aluno"),
+                         values=("", "← escreve aqui para adicionar aluno"),
                          tags=("novo",))
 
     # ── Interação ────────────────────────────────────────────────────────────
@@ -357,48 +438,37 @@ class TabelaAlunos(tk.Frame):
         col_idx = int(col[1:]) - 1  # "#1" → 0
 
         vals = list(self.tree.item(item, "values"))
-        while len(vals) < 3:
+        while len(vals) < 2:
             vals.append("")
         cur = vals[col_idx]
 
         # Limpa placeholder da linha nova
-        if item == self.NOVO_ID and col_idx == 2:
+        if item == self.NOVO_ID and col_idx == 1:
             cur = ""
 
-        if col_idx == 0:
-            # Tipo: combobox
-            var = tk.StringVar(value=cur if cur in ("CEF", "CP") else "CEF")
-            widget = ttk.Combobox(
-                self.tree, textvariable=var,
-                values=["CEF", "CP"], state="readonly",
-                font=("Segoe UI", 13),
-            )
-            widget.bind("<<ComboboxSelected>>",
-                        lambda e, v=var, i=item, c=col_idx: self._commit(i, c, v.get()))
-            widget.bind("<FocusOut>",
-                        lambda e, v=var, i=item, c=col_idx: self._commit(i, c, v.get()))
-        else:
-            widget = tk.Entry(
-                self.tree,
-                font=("Segoe UI", 13),
-                bg="#0d1b2a", fg="white",
-                insertbackground="white",
-                relief="flat", bd=0,
-                highlightthickness=2,
-                highlightcolor="#3b82f6",
-                highlightbackground="#2a2a4a",
-            )
-            widget.insert(0, cur)
-            widget.select_range(0, "end")
+        widget = tk.Entry(
+            self.tree,
+            font=("Segoe UI", 13),
+            bg="#0d1b2a", fg="white",
+            insertbackground="white",
+            relief="flat", bd=0,
+            highlightthickness=2,
+            highlightcolor="#3b82f6",
+            highlightbackground="#2a2a4a",
+        )
+        widget.insert(0, cur)
+        widget.select_range(0, "end")
 
-            widget.bind("<Return>",
-                        lambda e, w=widget, i=item, c=col_idx: self._commit_next(i, c, w))
-            widget.bind("<Tab>",
-                        lambda e, w=widget, i=item, c=col_idx: (
-                            self._commit_next(i, c, w), "break")[1])
-            widget.bind("<Escape>",   lambda e: self._close_popup())
-            widget.bind("<FocusOut>",
-                        lambda e, w=widget, i=item, c=col_idx: self._commit(i, c, self._safe_get(w)))
+        widget.bind("<Return>",
+                    lambda e, w=widget, i=item, c=col_idx: self._commit_next(i, c, w))
+        widget.bind("<Tab>",
+                    lambda e, w=widget, i=item, c=col_idx: (
+                        self._commit_next(i, c, w), "break")[1])
+        widget.bind("<Escape>",   lambda e: self._close_popup())
+        widget.bind("<FocusOut>",
+                    lambda e, w=widget, i=item, c=col_idx: self._commit(i, c, self._safe_get(w)))
+        widget.bind("<Control-v>",
+                    lambda e, w=widget, i=item, c=col_idx: self._paste_handler(e, i, c, w))
 
         widget.place(x=x, y=y, width=w, height=h)
         widget.focus_set()
@@ -406,6 +476,63 @@ class TabelaAlunos(tk.Frame):
         self._popup      = widget
         self._popup_item = item
         self._popup_col  = col_idx
+
+    def _paste_handler(self, event, item: str, col_idx: int, widget):
+        try:
+            text = widget.clipboard_get()
+        except Exception:
+            return
+        lines = [l for l in text.splitlines() if l.strip()]
+        if len(lines) <= 1:
+            return  # paste normal de uma linha — deixa o tkinter tratar
+
+        self._close_popup()
+        col_names = ["numero_interno", "nome"]
+        all_items = [i for i in self.tree.get_children() if i != self.NOVO_ID]
+
+        start_idx = len(all_items) if item == self.NOVO_ID else (
+            all_items.index(item) if item in all_items else len(all_items)
+        )
+
+        for i, line in enumerate(lines):
+            parts = line.split("\t")
+            row_idx = start_idx + i
+
+            if row_idx < len(all_items):
+                existing = all_items[row_idx]
+                vals = list(self.tree.item(existing, "values"))
+                while len(vals) < 2:
+                    vals.append("")
+                for j, part in enumerate(parts):
+                    tc = col_idx + j
+                    if tc >= 2:
+                        break
+                    val = part.strip()
+                    vals[tc] = val
+                    try:
+                        with _conn() as c:
+                            c.execute(f"UPDATE jogadores SET {col_names[tc]}=? WHERE id=?",
+                                      (val or None, int(existing)))
+                    except Exception:
+                        pass
+                self.tree.item(existing, values=vals)
+            else:
+                num, nome = "", ""
+                for j, part in enumerate(parts):
+                    tc = col_idx + j
+                    val = part.strip()
+                    if tc == 0:
+                        num = val
+                    elif tc == 1:
+                        nome = val
+                if not nome and col_idx == 1 and len(parts) == 1:
+                    nome = parts[0].strip()
+                if nome:
+                    adicionar_aluno(nome, num, self.equipa_id)
+
+        self.load()
+        self.on_change()
+        return "break"
 
     def _close_popup(self):
         if self._popup is None:
@@ -436,19 +563,19 @@ class TabelaAlunos(tk.Frame):
         value = value.strip()
 
         vals = list(self.tree.item(item, "values"))
-        while len(vals) < 3:
+        while len(vals) < 2:
             vals.append("")
         vals[col_idx] = value
 
         if item == self.NOVO_ID:
-            nome = vals[2]
+            nome = vals[1]
             if nome and nome != "← escreve aqui para adicionar aluno":
-                self._save_novo(vals[0], vals[1], nome)
+                self._save_novo(vals[0], nome)
             return
 
         self.tree.item(item, values=vals)
 
-        col_names = ["tipo", "numero_interno", "nome"]
+        col_names = ["numero_interno", "nome"]
         col_name = col_names[col_idx]
         if col_name == "nome" and not value:
             return
@@ -464,7 +591,7 @@ class TabelaAlunos(tk.Frame):
         value = self._safe_get(widget)
         self._commit(item, col_idx, value)
         next_col = col_idx + 1
-        if next_col >= 3:
+        if next_col >= 2:
             nxt = self.tree.next(item)
             if nxt:
                 self.tree.selection_set(nxt)
@@ -475,17 +602,12 @@ class TabelaAlunos(tk.Frame):
 
     # ── Novo aluno ───────────────────────────────────────────────────────────
 
-    def _save_novo(self, tipo: str, num: str, nome: str):
+    def _save_novo(self, num: str, nome: str):
         if self._saving_novo:
             return
         self._saving_novo = True
         try:
-            adicionar_aluno(
-                nome,
-                tipo if tipo in ("CEF", "CP") else "CEF",
-                num,
-                self.equipa_id
-            )
+            adicionar_aluno(nome, num, self.equipa_id)
             self.load()
             self.on_change()
         finally:
@@ -591,6 +713,7 @@ class ConfigFrame(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self._equipa_sel: dict | None = None
         self._tabela: TabelaAlunos | None = None
+        self._equipa_btns: dict[int, ctk.CTkButton] = {}
         self._build()
 
     def _build(self):
@@ -632,20 +755,24 @@ class ConfigFrame(ctk.CTkFrame):
     # ── Equipas ──────────────────────────────────────────────────────────────
 
     def _refresh_equipas(self):
+        self._equipa_btns.clear()
         for w in self.lista_equipas.winfo_children():
             w.destroy()
         for eq in listar_equipas():
             self._linha_equipa(eq)
+        self._atualizar_cor_btns()
 
     def _linha_equipa(self, eq: dict):
         row = ctk.CTkFrame(self.lista_equipas, fg_color="transparent")
         row.pack(fill="x", pady=3)
-        ctk.CTkButton(
+        btn = ctk.CTkButton(
             row,
-            text=f"{eq['nome']}\n{eq['cef']} CEF · {eq['cp']} CP",
+            text=f"{eq['nome']}\n{eq['tipo']} · {eq['total']} aluno{'s' if eq['total'] != 1 else ''}",
             font=F_SMALL, anchor="w", height=58,
             command=lambda e=eq: self._sel_equipa(e)
-        ).pack(side="left", fill="x", expand=True)
+        )
+        btn.pack(side="left", fill="x", expand=True)
+        self._equipa_btns[eq["id"]] = btn
         ctk.CTkButton(row, text="✎", width=40, height=58, font=F_SMALL,
                       fg_color="transparent", border_width=1,
                       command=lambda e=eq: self._editar_equipa(e)).pack(side="left", padx=2)
@@ -660,9 +787,9 @@ class ConfigFrame(ctk.CTkFrame):
         if not d.resultado:
             return
         try:
-            criar_equipa(d.resultado)
+            criar_equipa(d.resultado["nome"], d.resultado["tipo"])
         except sqlite3.IntegrityError:
-            messagebox.showerror("Erro", f"Já existe uma equipa chamada '{d.resultado}'.")
+            messagebox.showerror("Erro", f"Já existe uma equipa chamada '{d.resultado['nome']}'.")
             return
         self._refresh_equipas()
 
@@ -672,13 +799,13 @@ class ConfigFrame(ctk.CTkFrame):
         if not d.resultado:
             return
         try:
-            renomear_equipa(eq["id"], d.resultado)
+            atualizar_equipa(eq["id"], d.resultado["nome"], d.resultado["tipo"])
         except sqlite3.IntegrityError:
-            messagebox.showerror("Erro", f"Já existe uma equipa chamada '{d.resultado}'.")
+            messagebox.showerror("Erro", f"Já existe uma equipa chamada '{d.resultado['nome']}'.")
             return
         self._refresh_equipas()
         if self._equipa_sel and self._equipa_sel["id"] == eq["id"]:
-            self._equipa_sel = {**self._equipa_sel, "nome": d.resultado}
+            self._equipa_sel = {**self._equipa_sel, "nome": d.resultado["nome"], "tipo": d.resultado["tipo"]}
             self._refresh_tabela()
 
     def _apagar_equipa(self, eq: dict):
@@ -691,8 +818,17 @@ class ConfigFrame(ctk.CTkFrame):
             self._placeholder()
         self._refresh_equipas()
 
+    def _atualizar_cor_btns(self):
+        sel_id = self._equipa_sel["id"] if self._equipa_sel else None
+        for eid, btn in self._equipa_btns.items():
+            if eid == sel_id:
+                btn.configure(fg_color=NAV_ACTIVE, hover_color=("#1e40af", "#1e40af"))
+            else:
+                btn.configure(fg_color=("#3b3b3b", "#3b3b3b"), hover_color=("gray85", "gray30"))
+
     def _sel_equipa(self, eq: dict):
         self._equipa_sel = eq
+        self._atualizar_cor_btns()
         self._refresh_tabela()
 
     # ── Tabela de alunos ─────────────────────────────────────────────────────
@@ -733,7 +869,7 @@ class ConfigFrame(ctk.CTkFrame):
 # ─── App Principal ────────────────────────────────────────────────────────────
 
 class QuemVaiApp(ctk.CTk):
-    def __init__(self):
+    def __init__(self, primeiro_uso: bool = False):
         super().__init__()
         self.title("Quem Vai?")
         self.geometry("940x660")
@@ -741,6 +877,8 @@ class QuemVaiApp(ctk.CTk):
         self.sorteio = Sorteio()
         self._build()
         self._nav("sorteio")
+        if primeiro_uso:
+            self.after(300, self._setup_primeiro_uso)
 
     def _build(self):
         self.grid_columnconfigure(1, weight=1)
@@ -751,8 +889,14 @@ class QuemVaiApp(ctk.CTk):
         sidebar.grid_propagate(False)
 
         ctk.CTkLabel(sidebar, text="Quem Vai?", font=F_TITLE).pack(
-            pady=(32, 40), padx=16
+            pady=(32, 4), padx=16
         )
+        cfg = _load_config()
+        nome_user = cfg.get("utilizador", "")
+        self.lbl_user = ctk.CTkLabel(
+            sidebar, text=nome_user, font=F_SMALL, text_color="gray50"
+        )
+        self.lbl_user.pack(pady=(0, 32), padx=16)
 
         self.btn_sorteio = ctk.CTkButton(
             sidebar, text="Sorteio", font=F_MEDIUM, height=BTN_H,
@@ -775,6 +919,13 @@ class QuemVaiApp(ctk.CTk):
         self.frame_sorteio.grid(row=0, column=1, sticky="nsew")
         self.frame_config.grid(row=0, column=1, sticky="nsew")
 
+    def _setup_primeiro_uso(self):
+        d = DialogoPrimeiroUso(self)
+        self.wait_window(d)
+        if d.nome:
+            _save_config({"utilizador": d.nome})
+            self.lbl_user.configure(text=d.nome)
+
     def _nav(self, destino: str):
         self.frame_sorteio.grid_remove()
         self.frame_config.grid_remove()
@@ -793,6 +944,10 @@ class QuemVaiApp(ctk.CTk):
 # ─── Arranque ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import tkinter as _tk
+    _root = _tk.Tk()
+    _root.withdraw()
     _setup_treeview_style()
+    primeiro_uso = not os.path.isdir(_app_folder())
     _init_db()
-    QuemVaiApp().mainloop()
+    QuemVaiApp(primeiro_uso=primeiro_uso).mainloop()

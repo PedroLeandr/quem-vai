@@ -71,16 +71,13 @@ def _setup_treeview_style():
 # ─── Base de Dados ────────────────────────────────────────────────────────────
 
 def _app_folder() -> str:
-    base = os.environ.get("APPDATA") or os.path.dirname(
+    return os.path.dirname(
         sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     )
-    return os.path.join(base, "quem-vai")
 
 
 def _db_path() -> str:
-    folder = _app_folder()
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "quem-vai.db")
+    return os.path.join(_app_folder(), "quem-vai.db")
 
 
 def _config_path() -> str:
@@ -125,6 +122,21 @@ def _init_db() -> None:
                 numero_interno TEXT,
                 equipa_id      INTEGER NOT NULL REFERENCES equipas(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS atividades (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS atividade_equipas (
+                atividade_id INTEGER NOT NULL REFERENCES atividades(id) ON DELETE CASCADE,
+                equipa_id    INTEGER NOT NULL REFERENCES equipas(id)    ON DELETE CASCADE,
+                num_alunos   INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (atividade_id, equipa_id)
+            );
+            CREATE TABLE IF NOT EXISTS participacoes (
+                atividade_id INTEGER NOT NULL REFERENCES atividades(id) ON DELETE CASCADE,
+                jogador_id   INTEGER NOT NULL REFERENCES jogadores(id)  ON DELETE CASCADE,
+                PRIMARY KEY (atividade_id, jogador_id)
+            );
         """)
     with _conn() as c:
         try:
@@ -142,11 +154,12 @@ def _init_db() -> None:
 
 def listar_equipas() -> list[dict]:
     with _conn() as c:
-        return c.execute(
+        rows = c.execute(
             "SELECT e.id, e.nome, e.tipo, COUNT(j.id) AS total"
             " FROM equipas e LEFT JOIN jogadores j ON j.equipa_id=e.id"
-            " GROUP BY e.id ORDER BY e.nome"
+            " GROUP BY e.id"
         ).fetchall()
+    return sorted(rows, key=lambda e: e["nome"].casefold())
 
 
 def listar_alunos(equipa_id: int) -> list[dict]:
@@ -188,55 +201,140 @@ def apagar_aluno(jid: int) -> None:
         c.execute("DELETE FROM jogadores WHERE id=?", (jid,))
 
 
-# ─── Lógica de Sorteio ────────────────────────────────────────────────────────
+# ─── Helpers DB: Atividades ───────────────────────────────────────────────────
 
-class Sorteio:
-    def __init__(self):
-        self.filas: dict[int, list[int]] = {}
-        self.historico: list[dict] = []
+def listar_atividades() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute("SELECT id, nome FROM atividades").fetchall()
+    return sorted(rows, key=lambda a: a["nome"].casefold())
 
-    def iniciar(self) -> None:
-        self.filas.clear()
-        with _conn() as c:
-            for eq in c.execute("SELECT id FROM equipas").fetchall():
-                ids = [r["id"] for r in c.execute(
-                    "SELECT id FROM jogadores WHERE equipa_id=?", (eq["id"],)
-                ).fetchall()]
-                random.shuffle(ids)
-                self.filas[eq["id"]] = ids
 
-    def sortear(self) -> dict | None:
-        disponiveis = [
-            (eid, jid) for eid, fila in self.filas.items() for jid in fila
-        ]
-        if not disponiveis:
-            self.iniciar()
-            disponiveis = [
-                (eid, jid) for eid, fila in self.filas.items() for jid in fila
-            ]
-        if not disponiveis:
-            return None
+def criar_atividade(nome: str) -> None:
+    with _conn() as c:
+        c.execute("INSERT INTO atividades (nome) VALUES (?)", (nome,))
 
-        eid, jid = random.choice(disponiveis)
-        self.filas[eid].remove(jid)
 
-        if not self.filas[eid]:
+def apagar_atividade(aid: int) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM atividades WHERE id=?", (aid,))
+
+
+def renomear_atividade(aid: int, nome: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE atividades SET nome=? WHERE id=?", (nome, aid))
+
+
+def get_config_atividade(aid: int) -> list[dict]:
+    equipas = listar_equipas()
+    with _conn() as c:
+        cfg = {row["equipa_id"]: row["num_alunos"] for row in c.execute(
+            "SELECT equipa_id, num_alunos FROM atividade_equipas WHERE atividade_id=?", (aid,)
+        ).fetchall()}
+        participaram = {row["equipa_id"]: row["cnt"] for row in c.execute(
+            "SELECT j.equipa_id, COUNT(*) AS cnt"
+            " FROM participacoes p JOIN jogadores j ON j.id=p.jogador_id"
+            " WHERE p.atividade_id=? GROUP BY j.equipa_id",
+            (aid,)
+        ).fetchall()}
+    for eq in equipas:
+        eq["num_alunos"]  = cfg.get(eq["id"], 0)
+        eq["participaram"] = participaram.get(eq["id"], 0)
+        eq["restantes"]   = eq["total"] - eq["participaram"]
+    return equipas
+
+
+def set_num_alunos(aid: int, equipa_id: int, num: int) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO atividade_equipas (atividade_id, equipa_id, num_alunos)"
+            " VALUES (?,?,?)",
+            (aid, equipa_id, num)
+        )
+
+
+def sortear_atividade(aid: int, pre_selected: dict[int, list[int]] | None = None) -> list[dict]:
+    pre_selected = pre_selected or {}
+
+    with _conn() as c:
+        config = {row["equipa_id"]: row for row in c.execute(
+            "SELECT ae.equipa_id, ae.num_alunos, e.nome AS equipa_nome, e.tipo"
+            " FROM atividade_equipas ae JOIN equipas e ON e.id=ae.equipa_id"
+            " WHERE ae.atividade_id=?",
+            (aid,)
+        ).fetchall()}
+
+    # Incluir equipas com apenas seleção manual
+    for eid in pre_selected:
+        if eid not in config:
             with _conn() as c:
-                ids = [r["id"] for r in c.execute(
-                    "SELECT id FROM jogadores WHERE equipa_id=?", (eid,)
-                ).fetchall()]
-                random.shuffle(ids)
-                self.filas[eid] = ids
+                row = c.execute(
+                    "SELECT id AS equipa_id, nome AS equipa_nome, tipo FROM equipas WHERE id=?", (eid,)
+                ).fetchone()
+            if row:
+                config[eid] = {**row, "num_alunos": 0}
 
+    resultados = []
+    for eid, cfg in config.items():
+        n = cfg["num_alunos"]
+        manual_ids = set(pre_selected.get(eid, []))
+        effective_n = max(n, len(manual_ids))
+        if effective_n == 0:
+            continue
+
+        def _get_disponiveis_nao_manual():
+            with _conn() as c:
+                return [j for j in c.execute(
+                    "SELECT j.id, j.nome, j.numero_interno FROM jogadores j"
+                    " WHERE j.equipa_id=?"
+                    "   AND j.id NOT IN (SELECT jogador_id FROM participacoes WHERE atividade_id=?)",
+                    (eid, aid)
+                ).fetchall() if j["id"] not in manual_ids]
+
+        disponiveis = _get_disponiveis_nao_manual()
+        needed_random = effective_n - len(manual_ids)
+
+        if needed_random > len(disponiveis):
+            with _conn() as c:
+                c.execute(
+                    "DELETE FROM participacoes WHERE atividade_id=?"
+                    " AND jogador_id IN (SELECT id FROM jogadores WHERE equipa_id=?)",
+                    (aid, eid)
+                )
+            disponiveis = _get_disponiveis_nao_manual()
+
+        random_sel = random.sample(disponiveis, min(needed_random, len(disponiveis)))
+
+        manual_players = []
+        if manual_ids:
+            with _conn() as c:
+                for mid in manual_ids:
+                    row = c.execute(
+                        "SELECT id, nome, numero_interno FROM jogadores WHERE id=?", (mid,)
+                    ).fetchone()
+                    if row:
+                        manual_players.append(row)
+
+        selecionados = manual_players + random_sel
         with _conn() as c:
-            row = c.execute(
-                "SELECT j.nome, e.tipo, j.numero_interno, e.nome AS equipa"
-                " FROM jogadores j JOIN equipas e ON e.id=j.equipa_id WHERE j.id=?",
-                (jid,)
-            ).fetchone()
+            for j in selecionados:
+                c.execute(
+                    "INSERT OR IGNORE INTO participacoes (atividade_id, jogador_id) VALUES (?,?)",
+                    (aid, j["id"])
+                )
+        for j in selecionados:
+            resultados.append({
+                "nome": j["nome"],
+                "numero_interno": j.get("numero_interno"),
+                "equipa": cfg["equipa_nome"],
+                "tipo": cfg["tipo"],
+            })
 
-        self.historico.append(row)
-        return row
+    return resultados
+
+
+def reset_atividade(aid: int) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM participacoes WHERE atividade_id=?", (aid,))
 
 
 # ─── Diálogo de Primeiro Uso ─────────────────────────────────────────────────
@@ -345,15 +443,17 @@ class TabelaAlunos(tk.Frame):
 
         self.tree = ttk.Treeview(
             self,
-            columns=("num", "nome"),
+            columns=("num", "nome", "del"),
             show="headings",
             style="Excel.Treeview",
             selectmode="browse",
         )
         self.tree.heading("num",  text="Nº Interno", anchor="w")
         self.tree.heading("nome", text="Nome",        anchor="w")
+        self.tree.heading("del",  text="",            anchor="center")
         self.tree.column("num",  width=130, minwidth=80,  stretch=False)
-        self.tree.column("nome", width=380, minwidth=120, stretch=True)
+        self.tree.column("nome", width=340, minwidth=120, stretch=True)
+        self.tree.column("del",  width=44,  minwidth=44,  stretch=False)
 
         vsb = ttk.Scrollbar(self, orient="vertical",
                             command=self.tree.yview,
@@ -377,6 +477,7 @@ class TabelaAlunos(tk.Frame):
         self.tree.tag_configure("alt",  background="#28283a", foreground="#ffffff")
         self.tree.tag_configure("novo", foreground="#445566",
                                 font=("Segoe UI", 12, "italic"))
+        self.tree.tag_configure("del_hover", foreground="#ef4444")
 
         self.tree.bind("<ButtonRelease-1>", self._on_click)
         self.tree.bind("<Return>", lambda e: self._on_enter())
@@ -393,10 +494,10 @@ class TabelaAlunos(tk.Frame):
         for i, a in enumerate(listar_alunos(self.equipa_id)):
             tags = ("alt",) if i % 2 else ()
             self.tree.insert("", "end", iid=str(a["id"]),
-                             values=(a["numero_interno"] or "", a["nome"]),
+                             values=(a["numero_interno"] or "", a["nome"], "🗑"),
                              tags=tags)
         self.tree.insert("", "end", iid=self.NOVO_ID,
-                         values=("", "← escreve aqui para adicionar aluno"),
+                         values=("", "← escreve aqui para adicionar aluno", ""),
                          tags=("novo",))
 
     # ── Interação ────────────────────────────────────────────────────────────
@@ -404,7 +505,11 @@ class TabelaAlunos(tk.Frame):
     def _on_click(self, event):
         item = self.tree.identify_row(event.y)
         col  = self.tree.identify_column(event.x)
-        if item and col:
+        if not item or not col:
+            return
+        if col == "#3" and item != self.NOVO_ID:
+            self._delete_row(int(item))
+        else:
             self._open_popup(item, col)
 
     def _on_enter(self):
@@ -629,81 +734,408 @@ class TabelaAlunos(tk.Frame):
         self.on_change()
 
 
-# ─── Frame: Sorteio ──────────────────────────────────────────────────────────
+# ─── Diálogo de Seleção Manual ───────────────────────────────────────────────
 
-class SorteioFrame(ctk.CTkFrame):
-    def __init__(self, parent, sorteio: Sorteio):
+class DialogoSelecaoManual(ctk.CTkToplevel):
+    def __init__(self, parent, equipa: dict, aid: int, pre_selected: list[int]):
+        super().__init__(parent)
+        self.title(f"Selecionar — {equipa['nome']}")
+        self.geometry("400x480")
+        self.resizable(False, True)
+        self.selecionados: list[int] = []
+        self._aid = aid
+        self._vars: dict[int, tk.BooleanVar] = {}
+
+        with _conn() as c:
+            jogadores = c.execute(
+                "SELECT id, nome, numero_interno FROM jogadores WHERE equipa_id=? ORDER BY nome",
+                (equipa["id"],)
+            ).fetchall()
+            participaram = {r["jogador_id"] for r in c.execute(
+                "SELECT jogador_id FROM participacoes WHERE atividade_id=?", (aid,)
+            ).fetchall()}
+
+        pre_set = set(pre_selected)
+
+        ctk.CTkLabel(self, text=equipa["nome"], font=F_LARGE).pack(pady=(18, 4))
+        ctk.CTkLabel(self, text="Seleciona quem vai neste sorteio", font=F_SMALL,
+                     text_color="gray50").pack(pady=(0, 10))
+
+        scroll = ctk.CTkScrollableFrame(self)
+        scroll.pack(fill="both", expand=True, padx=16)
+
+        for j in jogadores:
+            var = tk.BooleanVar(value=j["id"] in pre_set)
+            self._vars[j["id"]] = var
+            num = f"  (Nº{j['numero_interno']})" if j.get("numero_interno") else ""
+            txt = f"{j['nome']}{num}"
+            state = "disabled" if j["id"] in participaram else "normal"
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            cb = ctk.CTkCheckBox(row, text=txt, variable=var, font=F_SMALL,
+                                 state=state, command=self._atualizar_contador)
+            cb.pack(side="left", padx=8)
+            if j["id"] in participaram:
+                ctk.CTkLabel(row, text="já participou", font=("Segoe UI", 11),
+                             text_color="gray40").pack(side="right", padx=8)
+
+        self.lbl_contador = ctk.CTkLabel(self, text="", font=F_SMALL, text_color="gray60")
+        self.lbl_contador.pack(pady=(8, 4))
+
+        ctk.CTkButton(self, text="Confirmar", font=F_MEDIUM, height=BTN_H,
+                      command=self._confirmar).pack(padx=16, pady=(0, 16), fill="x")
+
+        self._atualizar_contador()
+        self.after(150, self._on_show)
+
+    def _on_show(self):
+        self.lift()
+        self.grab_set()
+
+    def _atualizar_contador(self):
+        n = sum(1 for v in self._vars.values() if v.get())
+        self.lbl_contador.configure(text=f"{n} selecionado{'s' if n != 1 else ''} manualmente")
+
+    def _confirmar(self):
+        self.selecionados = [jid for jid, v in self._vars.items() if v.get()]
+        self.destroy()
+
+
+# ─── Diálogo de Atividade ─────────────────────────────────────────────────────
+
+class DialogoAtividade(ctk.CTkToplevel):
+    def __init__(self, parent, atividade: dict | None = None):
+        super().__init__(parent)
+        self.title("Brigada")
+        self.geometry("380x175")
+        self.resizable(False, False)
+        self.resultado = None
+
+        ctk.CTkLabel(self, text="Nome da brigada:", font=F_MEDIUM).pack(pady=(20, 6))
+        self.entry = ctk.CTkEntry(self, font=F_MEDIUM, height=BTN_H, width=320)
+        self.entry.pack()
+        if atividade:
+            self.entry.insert(0, atividade["nome"])
+
+        ctk.CTkButton(self, text="Guardar", font=F_MEDIUM, height=BTN_H,
+                      command=self._guardar).pack(pady=14)
+        self.entry.bind("<Return>", lambda _: self._guardar())
+        self.after(150, self._on_show)
+
+    def _on_show(self):
+        self.lift()
+        self.grab_set()
+        self.entry.focus_set()
+
+    def _guardar(self):
+        nome = self.entry.get().strip()
+        if not nome:
+            messagebox.showerror("Erro", "O nome não pode estar vazio.", parent=self)
+            return
+        self.resultado = nome
+        self.destroy()
+
+
+# ─── Frame: Atividades ────────────────────────────────────────────────────────
+
+class AtividadesFrame(ctk.CTkFrame):
+    def __init__(self, parent):
         super().__init__(parent, fg_color="transparent")
-        self.sorteio = sorteio
+        self._ativ_sel: dict | None = None
+        self._ativ_btns: dict[int, ctk.CTkButton] = {}
+        self._entries_num: dict[int, ctk.CTkEntry] = {}
+        self._sel_btns: dict[int, ctk.CTkButton] = {}
+        self._selecao_manual: dict[int, list[int]] = {}
+        self._historico: list[list[dict]] = []
+        self.lista_hist = None
         self._build()
 
     def _build(self):
-        self.card = ctk.CTkFrame(self, corner_radius=12, height=170)
-        self.card.pack(fill="x", padx=24, pady=(24, 12))
-        self.card.pack_propagate(False)
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=24, pady=(24, 12))
+        ctk.CTkLabel(header, text="Brigadas", font=F_LARGE).pack(side="left")
+        ctk.CTkButton(
+            header, text="+ Brigada", font=F_SMALL, height=40, width=140,
+            command=self._nova_ativ
+        ).pack(side="right")
 
-        self.lbl_nome = ctk.CTkLabel(
-            self.card, text="—", font=("Segoe UI", 36, "bold"), wraplength=580
+        paineis = ctk.CTkFrame(self, fg_color="transparent")
+        paineis.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+        paineis.columnconfigure(0, weight=2)
+        paineis.columnconfigure(1, weight=3)
+        paineis.rowconfigure(0, weight=1)
+
+        self.lista_ativs = ctk.CTkScrollableFrame(paineis, label_text="Brigadas")
+        self.lista_ativs.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+        self.painel_dir = ctk.CTkFrame(paineis)
+        self.painel_dir.grid(row=0, column=1, sticky="nsew")
+
+        self._placeholder_ativ()
+
+    def _placeholder_ativ(self):
+        for w in self.painel_dir.winfo_children():
+            w.destroy()
+        self.lista_hist = None
+        ctk.CTkLabel(
+            self.painel_dir,
+            text="Seleciona uma brigada para configurar",
+            font=F_MEDIUM, text_color="gray50"
+        ).pack(expand=True)
+
+    def on_show(self):
+        self._refresh_ativs()
+
+    # ── Lista de atividades ───────────────────────────────────────────────────
+
+    def _refresh_ativs(self):
+        self._ativ_btns.clear()
+        for w in self.lista_ativs.winfo_children():
+            w.destroy()
+        for at in listar_atividades():
+            self._linha_ativ(at)
+        self._atualizar_cor_btns()
+
+    def _linha_ativ(self, at: dict):
+        row = ctk.CTkFrame(self.lista_ativs, fg_color="transparent")
+        row.pack(fill="x", pady=3)
+        btn = ctk.CTkButton(
+            row, text=at["nome"],
+            font=F_SMALL, anchor="w", height=48,
+            command=lambda a=at: self._sel_ativ(a)
         )
-        self.lbl_nome.pack(expand=True, pady=(20, 4))
+        btn.pack(side="left", fill="x", expand=True)
+        self._ativ_btns[at["id"]] = btn
+        ctk.CTkButton(row, text="✎", width=40, height=48, font=F_SMALL,
+                      fg_color="transparent", border_width=1,
+                      command=lambda a=at: self._editar_ativ(a)).pack(side="left", padx=2)
+        ctk.CTkButton(row, text="✕", width=40, height=48, font=F_SMALL,
+                      fg_color="transparent", border_width=1,
+                      text_color=("red", "#ef4444"),
+                      command=lambda a=at: self._apagar_ativ(a)).pack(side="left")
 
-        self.lbl_info = ctk.CTkLabel(self.card, text="", font=F_MEDIUM, text_color="gray60")
-        self.lbl_info.pack(pady=(0, 16))
+    def _nova_ativ(self):
+        d = DialogoAtividade(self)
+        self.wait_window(d)
+        if not d.resultado:
+            return
+        try:
+            criar_atividade(d.resultado)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Erro", f"Já existe uma brigada chamada '{d.resultado}'.")
+            return
+        self._refresh_ativs()
 
-        self.btn_sortear = ctk.CTkButton(
-            self, text="SORTEAR", font=("Segoe UI", 24, "bold"),
+    def _editar_ativ(self, at: dict):
+        d = DialogoAtividade(self, at)
+        self.wait_window(d)
+        if not d.resultado:
+            return
+        try:
+            renomear_atividade(at["id"], d.resultado)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Erro", f"Já existe uma brigada chamada '{d.resultado}'.")
+            return
+        self._refresh_ativs()
+        if self._ativ_sel and self._ativ_sel["id"] == at["id"]:
+            self._ativ_sel = {**self._ativ_sel, "nome": d.resultado}
+            self._refresh_painel_ativ()
+
+    def _apagar_ativ(self, at: dict):
+        if not messagebox.askyesno("Confirmar", f"Apagar '{at['nome']}'?"):
+            return
+        apagar_atividade(at["id"])
+        if self._ativ_sel and self._ativ_sel["id"] == at["id"]:
+            self._ativ_sel = None
+            self._historico.clear()
+            self._placeholder_ativ()
+        self._refresh_ativs()
+
+    def _atualizar_cor_btns(self):
+        sel_id = self._ativ_sel["id"] if self._ativ_sel else None
+        for aid, btn in self._ativ_btns.items():
+            if aid == sel_id:
+                btn.configure(fg_color=NAV_ACTIVE, hover_color=("#1e40af", "#1e40af"))
+            else:
+                btn.configure(fg_color=("#3b3b3b", "#3b3b3b"), hover_color=("gray85", "gray30"))
+
+    def _sel_ativ(self, at: dict):
+        self._ativ_sel = at
+        self._historico.clear()
+        self._selecao_manual.clear()
+        self._atualizar_cor_btns()
+        self._refresh_painel_ativ()
+
+    # ── Painel direito ────────────────────────────────────────────────────────
+
+    def _refresh_painel_ativ(self):
+        for w in self.painel_dir.winfo_children():
+            w.destroy()
+        self._entries_num.clear()
+        self._sel_btns.clear()
+        self.lista_hist = None
+
+        at = self._ativ_sel
+        if at is None:
+            self._placeholder_ativ()
+            return
+
+        equipas = get_config_atividade(at["id"])
+
+        # Título
+        topo = ctk.CTkFrame(self.painel_dir, fg_color="transparent")
+        topo.pack(fill="x", padx=16, pady=(16, 8))
+        ctk.CTkLabel(topo, text=at["nome"], font=F_LARGE).pack(side="left")
+
+        # Cards de equipas num frame scrollável
+        scroll_eq = ctk.CTkScrollableFrame(self.painel_dir, height=min(240, max(80, len(equipas) * 58)))
+        scroll_eq.pack(fill="x", padx=16, pady=(0, 8))
+
+        for eq in equipas:
+            card = ctk.CTkFrame(scroll_eq, corner_radius=8)
+            card.pack(fill="x", pady=3)
+
+            # Lado esquerdo: nome + contador
+            left = ctk.CTkFrame(card, fg_color="transparent")
+            left.pack(side="left", fill="x", expand=True, padx=12, pady=8)
+            ctk.CTkLabel(left, text=f"{eq['nome']}  ({eq['tipo']})",
+                         font=F_SMALL, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(left,
+                         text=f"Faltam {eq['restantes']} de {eq['total']}",
+                         font=("Segoe UI", 12), text_color="gray50", anchor="w").pack(anchor="w")
+
+            # Lado direito: botão escolher + entrada nº alunos
+            right = ctk.CTkFrame(card, fg_color="transparent")
+            right.pack(side="right", padx=12)
+
+            n_manual = len(self._selecao_manual.get(eq["id"], []))
+            sel_txt = f"✓ {n_manual}" if n_manual else "Escolher"
+            sel_btn = ctk.CTkButton(
+                right, text=sel_txt, width=90, height=36, font=F_SMALL,
+                fg_color=NAV_ACTIVE if n_manual else "transparent",
+                border_width=1,
+                hover_color=("#1e40af", "#1e40af") if n_manual else ("gray85", "gray30"),
+                command=lambda e=eq: self._abrir_selecao(e)
+            )
+            sel_btn.pack(side="left", padx=(0, 8))
+            self._sel_btns[eq["id"]] = sel_btn
+
+            ctk.CTkLabel(right, text="Nº alunos:", font=F_SMALL).pack(side="left", padx=(0, 6))
+            entry = ctk.CTkEntry(right, width=64, height=36, font=F_SMALL, justify="center")
+            entry.insert(0, str(eq["num_alunos"]))
+            entry.pack(side="left")
+            self._entries_num[eq["id"]] = entry
+
+            entry.bind("<FocusOut>", lambda e, eid=eq["id"]: self._save_num(eid))
+            entry.bind("<Return>",   lambda e, eid=eq["id"]: self._save_num(eid))
+
+        # Botões
+        ctk.CTkButton(
+            self.painel_dir, text="SORTEAR", font=("Segoe UI", 24, "bold"),
             height=72, corner_radius=12, command=self._sortear
-        )
-        self.btn_sortear.pack(fill="x", padx=24, pady=8)
+        ).pack(fill="x", padx=16, pady=(8, 4))
 
         ctk.CTkButton(
-            self, text="Reiniciar sessão", font=F_SMALL, height=38,
+            self.painel_dir, text="Reiniciar sessão", font=F_SMALL, height=38,
             fg_color="transparent", border_width=1,
             hover_color=("gray85", "gray30"),
             command=self._reiniciar
-        ).pack(padx=24, pady=(0, 16))
+        ).pack(padx=16, pady=(0, 8))
 
-        ctk.CTkLabel(self, text="Histórico desta sessão", font=F_MEDIUM).pack(
-            anchor="w", padx=24
-        )
-        self.lista = ctk.CTkScrollableFrame(self, height=180)
-        self.lista.pack(fill="both", expand=True, padx=24, pady=(4, 24))
+        ctk.CTkLabel(self.painel_dir, text="Histórico desta sessão",
+                     font=F_MEDIUM).pack(anchor="w", padx=16)
 
-    def on_show(self):
-        if not self.sorteio.historico:
-            self.sorteio.iniciar()
+        self.lista_hist = ctk.CTkScrollableFrame(self.painel_dir)
+        self.lista_hist.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+
+        self._refresh_historico()
+
+    def _abrir_selecao(self, eq: dict):
+        if self._ativ_sel is None:
+            return
+        pre = self._selecao_manual.get(eq["id"], [])
+        d = DialogoSelecaoManual(self, eq, self._ativ_sel["id"], pre)
+        self.wait_window(d)
+        self._selecao_manual[eq["id"]] = d.selecionados
+
+        # Actualiza botão
+        btn = self._sel_btns.get(eq["id"])
+        if btn:
+            n = len(d.selecionados)
+            btn.configure(
+                text=f"✓ {n}" if n else "Escolher",
+                fg_color=NAV_ACTIVE if n else "transparent",
+                hover_color=("#1e40af", "#1e40af") if n else ("gray85", "gray30"),
+            )
+
+        # Se manual > num_alunos configurado, aumenta automaticamente
+        entry = self._entries_num.get(eq["id"])
+        if entry:
+            try:
+                current = int(entry.get())
+            except ValueError:
+                current = 0
+            n = len(d.selecionados)
+            if n > current:
+                entry.delete(0, "end")
+                entry.insert(0, str(n))
+                set_num_alunos(self._ativ_sel["id"], eq["id"], n)
+
+    def _save_num(self, equipa_id: int):
+        entry = self._entries_num.get(equipa_id)
+        if entry is None or self._ativ_sel is None:
+            return
+        try:
+            val = max(0, int(entry.get()))
+        except ValueError:
+            val = 0
+        entry.delete(0, "end")
+        entry.insert(0, str(val))
+        set_num_alunos(self._ativ_sel["id"], equipa_id, val)
 
     def _sortear(self):
-        r = self.sorteio.sortear()
-        if r is None:
+        if self._ativ_sel is None:
+            return
+        for eid in list(self._entries_num):
+            self._save_num(eid)
+        resultados = sortear_atividade(self._ativ_sel["id"], self._selecao_manual)
+        self._selecao_manual.clear()
+        if not resultados:
             messagebox.showinfo(
                 "Sem alunos",
-                "Não há alunos configurados.\n"
-                "Vai a 'Configurar' para adicionar equipas e alunos."
+                "Nenhuma equipa tem alunos configurados.\n"
+                "Define o número de alunos por equipa antes de sortear a brigada."
             )
             return
-        self.lbl_nome.configure(text=r["nome"])
-        num = f"  •  Nº {r['numero_interno']}" if r.get("numero_interno") else ""
-        self.lbl_info.configure(text=f"{r['equipa']}  •  {r['tipo']}{num}")
-        self._refresh_historico()
+        self._historico.append(resultados)
+        self._refresh_painel_ativ()
 
     def _reiniciar(self):
-        self.sorteio.historico.clear()
-        self.sorteio.iniciar()
-        self.lbl_nome.configure(text="—")
-        self.lbl_info.configure(text="")
-        self._refresh_historico()
+        if self._ativ_sel is None:
+            return
+        reset_atividade(self._ativ_sel["id"])
+        self._historico.clear()
+        self._refresh_painel_ativ()
 
     def _refresh_historico(self):
-        for w in self.lista.winfo_children():
+        if self.lista_hist is None:
+            return
+        for w in self.lista_hist.winfo_children():
             w.destroy()
-        for r in reversed(self.sorteio.historico):
-            num = f"  Nº {r['numero_interno']}" if r.get("numero_interno") else ""
-            ctk.CTkLabel(
-                self.lista,
-                text=f"{r['nome']}{num}  —  {r['equipa']}  ({r['tipo']})",
-                font=F_SMALL, anchor="w"
-            ).pack(fill="x", padx=8, pady=2)
+        for ronda in reversed(self._historico):
+            por_equipa: dict[str, list[str]] = {}
+            for r in ronda:
+                num = f" (Nº{r['numero_interno']})" if r.get("numero_interno") else ""
+                por_equipa.setdefault(r["equipa"], []).append(f"{r['nome']}{num}")
+
+            frame_ronda = ctk.CTkFrame(self.lista_hist, fg_color="#1e1e2e", corner_radius=8)
+            frame_ronda.pack(fill="x", padx=2, pady=4)
+            for equipa, nomes in por_equipa.items():
+                ctk.CTkLabel(
+                    frame_ronda,
+                    text=f"{equipa}: {', '.join(nomes)}",
+                    font=F_SMALL, anchor="w", wraplength=420
+                ).pack(fill="x", padx=10, pady=3)
 
 
 # ─── Frame: Configurar ───────────────────────────────────────────────────────
@@ -874,9 +1306,10 @@ class QuemVaiApp(ctk.CTk):
         self.title("Quem Vai?")
         self.geometry("940x660")
         self.minsize(720, 520)
-        self.sorteio = Sorteio()
+        self.after(10, lambda: self.state("zoomed"))
         self._build()
-        self._nav("sorteio")
+        self._nav("atividades")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         if primeiro_uso:
             self.after(300, self._setup_primeiro_uso)
 
@@ -898,13 +1331,13 @@ class QuemVaiApp(ctk.CTk):
         )
         self.lbl_user.pack(pady=(0, 32), padx=16)
 
-        self.btn_sorteio = ctk.CTkButton(
-            sidebar, text="Sorteio", font=F_MEDIUM, height=BTN_H,
+        self.btn_atividades = ctk.CTkButton(
+            sidebar, text="Brigadas", font=F_MEDIUM, height=BTN_H,
             anchor="w", fg_color=NAV_INACTIVE,
             hover_color=("gray85", "gray30"),
-            command=lambda: self._nav("sorteio")
+            command=lambda: self._nav("atividades")
         )
-        self.btn_sorteio.pack(fill="x", padx=12, pady=4)
+        self.btn_atividades.pack(fill="x", padx=12, pady=4)
 
         self.btn_config = ctk.CTkButton(
             sidebar, text="Configurar", font=F_MEDIUM, height=BTN_H,
@@ -914,10 +1347,14 @@ class QuemVaiApp(ctk.CTk):
         )
         self.btn_config.pack(fill="x", padx=12, pady=4)
 
-        self.frame_sorteio = SorteioFrame(self, self.sorteio)
-        self.frame_config  = ConfigFrame(self)
-        self.frame_sorteio.grid(row=0, column=1, sticky="nsew")
+        self.frame_atividades = AtividadesFrame(self)
+        self.frame_config     = ConfigFrame(self)
+        self.frame_atividades.grid(row=0, column=1, sticky="nsew")
         self.frame_config.grid(row=0, column=1, sticky="nsew")
+
+    def _on_close(self):
+        self.quit()
+        self.destroy()
 
     def _setup_primeiro_uso(self):
         d = DialogoPrimeiroUso(self)
@@ -927,18 +1364,18 @@ class QuemVaiApp(ctk.CTk):
             self.lbl_user.configure(text=d.nome)
 
     def _nav(self, destino: str):
-        self.frame_sorteio.grid_remove()
+        self.frame_atividades.grid_remove()
         self.frame_config.grid_remove()
-        if destino == "sorteio":
-            self.frame_sorteio.grid()
-            self.frame_sorteio.on_show()
-            self.btn_sorteio.configure(fg_color=NAV_ACTIVE)
+        if destino == "atividades":
+            self.frame_atividades.grid()
+            self.frame_atividades.on_show()
+            self.btn_atividades.configure(fg_color=NAV_ACTIVE)
             self.btn_config.configure(fg_color=NAV_INACTIVE)
         else:
             self.frame_config.grid()
             self.frame_config.on_show()
             self.btn_config.configure(fg_color=NAV_ACTIVE)
-            self.btn_sorteio.configure(fg_color=NAV_INACTIVE)
+            self.btn_atividades.configure(fg_color=NAV_INACTIVE)
 
 
 # ─── Arranque ─────────────────────────────────────────────────────────────────
